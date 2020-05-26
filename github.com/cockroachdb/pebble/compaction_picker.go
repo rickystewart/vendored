@@ -8,6 +8,7 @@ import (
 	"math"
 	"sort"
 
+	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/manifest"
 )
 
@@ -79,6 +80,26 @@ type pickedCompactionInfo struct {
 	file int
 }
 
+// compensatedSize returns f's file size, inflated according to compaction
+// priorities.
+func compensatedSize(f *fileMetadata) uint64 {
+	sz := f.Size
+	// If stats are available for this file, add in the estimate of disk space
+	// that may be reclaimed by compacting the file's range tombstones.
+	if f.Stats.Valid {
+		sz += f.Stats.RangeDeletionsBytesEstimate
+	}
+	return sz
+}
+
+func totalCompensatedSize(files []*fileMetadata) uint64 {
+	var sz uint64
+	for _, f := range files {
+		sz += compensatedSize(f)
+	}
+	return sz
+}
+
 // compactionPickerByScore holds the state and logic for picking a compaction. A
 // compaction picker is associated with a single version. A new compaction
 // picker is created and initialized every time a new version is installed.
@@ -136,40 +157,33 @@ func (p *compactionPickerByScore) estimatedCompactionDebt(l0ExtraSize uint64) ui
 		return 0
 	}
 
-	// We assume that all the bytes in L0 need to be compacted to L1. This is unlike
-	// the RocksDB logic that figures out whether L0 needs compaction.
-	compactionDebt := totalSize(p.vers.Files[0]) + l0ExtraSize
-	bytesAddedToNextLevel := compactionDebt
+	// We assume that all the bytes in L0 need to be compacted to Lbase. This is
+	// unlike the RocksDB logic that figures out whether L0 needs compaction.
+	bytesAddedToNextLevel := l0ExtraSize + totalSize(p.vers.Files[0])
+	nextLevelSize := totalSize(p.vers.Files[p.baseLevel])
 
-	levelSize := totalSize(p.vers.Files[p.baseLevel])
-	// estimatedL0CompactionSize is the estimated size of the L0 component in the
-	// current or next L0->LBase compaction. This is needed to estimate the number
-	// of L0->LBase compactions which will need to occur for the LSM tree to
-	// become stable.
-	estimatedL0CompactionSize := uint64(p.opts.L0CompactionThreshold * p.opts.MemTableSize)
-	// The ratio bytesAddedToNextLevel(L0 Size)/estimatedL0CompactionSize is the
-	// estimated number of L0->LBase compactions which will need to occur for the
-	// LSM tree to become stable. Let this ratio be N.
-	//
-	// We assume that each of these N compactions will overlap with all the current bytes
-	// in LBase, so we multiply N * totalSize(LBase) to count the contribution of LBase inputs
-	// to these compactions. Note that each compaction is adding bytes to LBase that will take
-	// part in future compactions, but we have already counted those.
-	compactionDebt += (levelSize * bytesAddedToNextLevel) / estimatedL0CompactionSize
+	var compactionDebt uint64
+	if bytesAddedToNextLevel > 0 && nextLevelSize > 0 {
+		// We only incur compaction debt if both L0 and Lbase contain data. If L0
+		// is empty, no compaction is necessary. If Lbase is empty, a move-based
+		// compaction from L0 would occur.
+		compactionDebt += bytesAddedToNextLevel + nextLevelSize
+	}
 
-	var nextLevelSize uint64
 	for level := p.baseLevel; level < numLevels-1; level++ {
-		levelSize += bytesAddedToNextLevel
-		bytesAddedToNextLevel = 0
+		levelSize := nextLevelSize + bytesAddedToNextLevel
 		nextLevelSize = totalSize(p.vers.Files[level+1])
 		if levelSize > uint64(p.levelMaxBytes[level]) {
 			bytesAddedToNextLevel = levelSize - uint64(p.levelMaxBytes[level])
-			levelRatio := float64(nextLevelSize) / float64(levelSize)
-			// The current level contributes bytesAddedToNextLevel to compactions.
-			// The next level contributes levelRatio * bytesAddedToNextLevel.
-			compactionDebt += uint64(float64(bytesAddedToNextLevel) * (levelRatio + 1))
+			if nextLevelSize > 0 {
+				// We only incur compaction debt if the next level contains data. If the
+				// next level is empty, a move-based compaction would be used.
+				levelRatio := float64(nextLevelSize) / float64(levelSize)
+				// The current level contributes bytesAddedToNextLevel to compactions.
+				// The next level contributes levelRatio * bytesAddedToNextLevel.
+				compactionDebt += uint64(float64(bytesAddedToNextLevel) * (levelRatio + 1))
+			}
 		}
-		levelSize = nextLevelSize
 	}
 
 	return compactionDebt
@@ -270,15 +284,18 @@ func (p *compactionPickerByScore) initSizeAdjust(inProgressCompactions []compact
 	}
 
 	// Compute a size adjustment for each level based on the in-progress
-	// compactions. We subtract the size of the start level inputs from the start
-	// level, and add the size of the start level inputs to the output
-	// level. This is slightly different from RocksDB's behavior, which simply
-	// elides compacting files from the level size calculation.
+	// compactions. We subtract the compensated size of the start level inputs
+	// from the start level. Since compensated file sizes may be compensated
+	// because they reclaim space from the output level's files, we add the
+	// real file size to the output level. This is slightly different from
+	// RocksDB's behavior, which simply elides compacting files from the level
+	// size calculation.
 	for i := range inProgressCompactions {
 		c := &inProgressCompactions[i]
-		size := int64(totalSize(c.inputs[0]))
-		p.sizeAdjust[c.startLevel] -= size
-		p.sizeAdjust[c.outputLevel] += size
+		compensated := int64(totalCompensatedSize(c.inputs[0]))
+		real := int64(totalSize(c.inputs[0]))
+		p.sizeAdjust[c.startLevel] -= compensated
+		p.sizeAdjust[c.outputLevel] += real
 	}
 }
 
@@ -293,14 +310,25 @@ func (p *compactionPickerByScore) initScores(inProgressCompactions []compactionI
 	p.initL0Score(inProgressCompactions)
 
 	for level := 1; level < numLevels-1; level++ {
-		size := int64(totalSize(p.vers.Files[level])) + p.sizeAdjust[level]
-		p.scores[level].score = float64(size) / float64(p.levelMaxBytes[level])
+		// Use the "compensated" file size when scoring. The file size is
+		// compensated by artifically inflating it to account for other
+		// priorities like reclaiming disk space beneath range tombstones.
+		levelSize := int64(totalCompensatedSize(p.vers.Files[level])) + p.sizeAdjust[level]
+		p.scores[level].score = float64(levelSize) / float64(p.levelMaxBytes[level])
 	}
 
 	sort.Sort(sortCompactionLevelsDecreasingScore(p.scores[:]))
 }
 
 func (p *compactionPickerByScore) initL0Score(inProgressCompactions []compactionInfo) {
+	if p.opts.Experimental.L0SublevelCompactions {
+		// If L0SubLevels are present, we use the sublevel count as opposed to
+		// the L0 file count to score this level. The base vs intra-L0
+		// compaction determination happens in pickAuto, not here.
+		p.scores[0].score =
+			float64(p.vers.L0SubLevels.MaxDepthAfterOngoingCompactions()) / float64(p.opts.L0CompactionThreshold)
+		return
+	}
 	// TODO(peter): The current scoring logic precludes concurrent L0->Lbase
 	// compactions in most cases because if there is an in-progress L0->Lbase
 	// compaction we'll instead preferentially score an intra-L0 compaction. One
@@ -372,41 +400,58 @@ func (p *compactionPickerByScore) initL0Score(inProgressCompactions []compaction
 	p.scores[0].outputLevel = 0
 }
 
-func (p *compactionPickerByScore) pickFile(level int) int {
-	// TODO(peter): Select the file within the level to compact. See the
-	// kMinOverlappingRatio heuristic in RocksDB which chooses the file with the
-	// minimum overlapping ratio with the next level. This minimizes write
-	// amplification. We also want to computed a "compensated size" which adjusts
-	// the size of a table based on the number of deletions it contains.
+func (p *compactionPickerByScore) pickFile(level, outputLevel int) int {
+	// Select the file within the level to compact. We want to minimize write
+	// amplification, but also ensure that deletes are propagated to the
+	// bottom level in a timely fashion so as to reclaim disk space. A table's
+	// smallest sequence number provides a measure of its age. The ratio of
+	// overlapping-bytes / table-size gives an indication of write
+	// amplification (a smaller ratio is preferrable).
 	//
-	// We want to minimize write amplification, but also ensure that deletes
-	// are propagated to the bottom level in a timely fashion so as to reclaim
-	// disk space. A table's smallest sequence number provides a measure of its
-	// age. The ratio of overlapping-bytes / table-size gives an indication of
-	// write amplification (a smaller ratio is preferrable).
+	// The current heuristic is based off the the RocksDB kMinOverlappingRatio
+	// heuristic. It chooses the file with the minimum overlapping ratio with
+	// the target level, which minimizes write amplification.
 	//
-	// Simulate various workloads:
-	// - Uniform random write
-	// - Uniform random write+delete
-	// - Skewed random write
-	// - Skewed random write+delete
-	// - Sequential write
-	// - Sequential write+delete (queue)
+	// It uses a "compensated size" for the denominator, which is the file
+	// size but artifically inflated by an estimate of the space that may be
+	// reclaimed through compaction. Currently, we only compensate for range
+	// deletions and only with a rough estimate of the reclaimable bytes. This
+	// differs from RocksDB which only compensates for point tombstones and
+	// only if they exceed the number of non-deletion entries in table.
+	//
+	// TODO(peter): For concurrent compactions, we may want to try harder to
+	// pick a seed file whose resulting compaction bounds do not overlap with
+	// an in-progress compaction.
 
-	// The current heuristic matches the RocksDB kOldestSmallestSeqFirst
-	// heuristic.
-	//
-	// TODO(peter): For concurrent compactions, we may want to try harder to pick
-	// a seed file whose resulting compaction bounds do not overlap with an
-	// in-progress compaction.
-	smallestSeqNum := uint64(math.MaxUint64)
+	cmp := p.opts.Comparer.Compare
+	targetFiles := p.vers.Files[outputLevel]
+	targetIndex := 0
+
 	file := -1
+	smallestRatio := uint64(math.MaxUint64)
+
 	for i, f := range p.vers.Files[level] {
-		if f.Compacting {
-			continue
+		var overlappingBytes uint64
+
+		// Move targetIndex past any files smaller than f
+		for targetIndex < len(targetFiles) && base.InternalCompare(cmp, targetFiles[targetIndex].Largest, f.Smallest) < 0 {
+			targetIndex++
 		}
-		if smallestSeqNum > f.SmallestSeqNum {
-			smallestSeqNum = f.SmallestSeqNum
+
+		for targetIndex < len(targetFiles) && base.InternalCompare(cmp, targetFiles[targetIndex].Smallest, f.Largest) < 0 {
+			overlappingBytes += targetFiles[targetIndex].Size
+			// If the file in the next level extends beyond f's largest key,
+			// break out and don't progress targetIndex because f's
+			// successor might also overlap.
+			if base.InternalCompare(cmp, targetFiles[targetIndex].Largest, f.Largest) > 0 {
+				break
+			}
+			targetIndex++
+		}
+
+		scaledRatio := overlappingBytes * 1024 / compensatedSize(f)
+		if scaledRatio < smallestRatio && !f.Compacting {
+			smallestRatio = scaledRatio
 			file = i
 		}
 	}
@@ -442,7 +487,18 @@ func (p *compactionPickerByScore) pickAuto(env compactionEnv) (c *compaction) {
 			break
 		}
 
-		info.file = p.pickFile(info.level)
+		if info.level == 0 && p.opts.Experimental.L0SublevelCompactions {
+			c = pickL0(env, p.opts, p.vers, p.baseLevel)
+			// Fail-safe to protect against compacting the same sstable
+			// concurrently.
+			if c != nil && !inputAlreadyCompacting(c) {
+				c.score = info.score
+				return c
+			}
+			continue
+		}
+
+		info.file = p.pickFile(info.level, info.outputLevel)
 		if info.file == -1 {
 			continue
 		}
@@ -514,6 +570,76 @@ func pickAutoHelper(
 	}
 
 	c.setupInputs()
+	return c
+}
+
+// Helper method to pick compactions originating from L0. Uses information about
+// sublevels to generate a compaction.
+func pickL0(env compactionEnv, opts *Options, vers *version, baseLevel int) (c *compaction) {
+	// It is important to pass information about Lbase files to L0SubLevels
+	// so it can pick a compaction that does not conflict with an Lbase => Lbase+1
+	// compaction. Without this, we observed reduced concurrency of L0=>Lbase
+	// compactions, and increasing read amplification in L0.
+	lcf, err := vers.L0SubLevels.PickBaseCompaction(
+		opts.L0CompactionThreshold, vers.Files[baseLevel])
+	if err != nil {
+		opts.Logger.Infof("error when picking base compaction: %s", err)
+		return
+	}
+	if lcf != nil {
+		// Manually build the compaction as opposed to calling
+		// pickAutoHelper. This is because L0SubLevels has already added
+		// any overlapping L0 SSTables that need to be added, and
+		// because compactions built by L0SSTables do not necessarily
+		// pick contiguous sequences of files in p.vers.Files[0].
+		c = newCompaction(opts, vers, 0, baseLevel, env.bytesCompacted)
+		c.lcf = lcf
+		if c.outputLevel != baseLevel {
+			opts.Logger.Fatalf("compaction picked unexpected output level: %d != %d", c.outputLevel, baseLevel)
+		}
+		c.inputs[0] = make([]*manifest.FileMetadata, 0, len(lcf.Files))
+		for j := range lcf.FilesIncluded {
+			if lcf.FilesIncluded[j] {
+				c.inputs[0] = append(c.inputs[0], vers.Files[0][j])
+			}
+		}
+		c.setupInputs()
+		if len(c.inputs[0]) == 0 {
+			opts.Logger.Fatalf("empty compaction chosen")
+		}
+		return c
+	}
+
+	// Couldn't choose a base compaction. Try choosing an intra-L0
+	// compaction.
+	lcf, err = vers.L0SubLevels.PickIntraL0Compaction(env.earliestUnflushedSeqNum, opts.L0CompactionThreshold)
+	if err != nil {
+		opts.Logger.Infof("error when picking base compaction: %s", err)
+		return
+	}
+	if lcf != nil {
+		c = newCompaction(opts, vers, 0, 0, env.bytesCompacted)
+		c.lcf = lcf
+		c.inputs[0] = make([]*manifest.FileMetadata, 0, len(lcf.Files))
+		for j := range lcf.FilesIncluded {
+			if lcf.FilesIncluded[j] {
+				c.inputs[0] = append(c.inputs[0], vers.Files[0][j])
+			}
+		}
+		if len(c.inputs[0]) == 0 {
+			opts.Logger.Fatalf("empty compaction chosen")
+		}
+		c.smallest, c.largest = manifest.KeyRange(c.cmp, c.inputs[0], nil)
+		c.setupInuseKeyRanges()
+		// Output only a single sstable for intra-L0 compactions.
+		// Now that we have the ability to split flushes, we could conceivably
+		// split the output of intra-L0 compactions too. This may be unnecessary
+		// complexity -- the inputs to intra-L0 should be narrow in the key space
+		// (unlike flushes), so writing a single sstable should be ok.
+		c.maxOutputFileSize = math.MaxUint64
+		c.maxOverlapBytes = math.MaxUint64
+		c.maxExpandedBytes = math.MaxUint64
+	}
 	return c
 }
 
