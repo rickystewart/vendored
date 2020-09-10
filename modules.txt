@@ -167,7 +167,7 @@ github.com/cockroachdb/crlfmt/internal/parser
 github.com/cockroachdb/crlfmt/internal/render
 # github.com/cockroachdb/datadriven v1.0.1-0.20200826112548-92602d883b11
 github.com/cockroachdb/datadriven
-# github.com/cockroachdb/errors v1.7.4
+# github.com/cockroachdb/errors v1.7.5
 github.com/cockroachdb/errors
 github.com/cockroachdb/errors/assert
 github.com/cockroachdb/errors/barriers
@@ -205,7 +205,7 @@ github.com/cockroachdb/gostdlib/x/tools/internal/semver
 github.com/cockroachdb/gostdlib/x/tools/internal/span
 # github.com/cockroachdb/logtags v0.0.0-20190617123548-eb05cc24525f
 github.com/cockroachdb/logtags
-# github.com/cockroachdb/pebble v0.0.0-20200908153531-a9c6d3b6685c
+# github.com/cockroachdb/pebble v0.0.0-20200910150114-e9a2c44e0bf1
 github.com/cockroachdb/pebble
 github.com/cockroachdb/pebble/bloom
 github.com/cockroachdb/pebble/internal/arenaskl
@@ -228,7 +228,7 @@ github.com/cockroachdb/pebble/internal/record
 github.com/cockroachdb/pebble/sstable
 github.com/cockroachdb/pebble/tool
 github.com/cockroachdb/pebble/vfs
-# github.com/cockroachdb/redact v1.0.5
+# github.com/cockroachdb/redact v1.0.6
 github.com/cockroachdb/redact
 github.com/cockroachdb/redact/internal
 github.com/cockroachdb/redact/internal/fmtsort
@@ -753,12 +753,12 @@ golang.org/x/crypto/ssh/agent
 golang.org/x/crypto/ssh/internal/bcrypt_pbkdf
 golang.org/x/crypto/ssh/knownhosts
 golang.org/x/crypto/ssh/terminal
-# golang.org/x/exp v0.0.0-20200901203048-c4f52b2c50aa
+# golang.org/x/exp v0.0.0-20200908183739-ae8ad444f925
 golang.org/x/exp/rand
 # golang.org/x/lint v0.0.0-20200130185559-910be7a94367
 golang.org/x/lint
 golang.org/x/lint/golint
-# golang.org/x/mod v0.3.0
+# golang.org/x/mod v0.3.1-0.20200828183125-ce943fd02449
 golang.org/x/mod/semver
 # golang.org/x/net v0.0.0-20200602114024-627f9648deb9
 golang.org/x/net/context
@@ -787,7 +787,7 @@ golang.org/x/perf/storage/benchfmt
 # golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e
 golang.org/x/sync/errgroup
 golang.org/x/sync/syncmap
-# golang.org/x/sys v0.0.0-20200824131525-c12d262b63d8
+# golang.org/x/sys v0.0.0-20200909081042-eff7692f9009
 golang.org/x/sys/cpu
 golang.org/x/sys/internal/unsafeheader
 golang.org/x/sys/unix
