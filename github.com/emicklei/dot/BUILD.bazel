@@ -1,0 +1,18 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "dot",
+    srcs = [
+        "attr.go",
+        "doc.go",
+        "edge.go",
+        "graph.go",
+        "graph_options.go",
+        "indent.go",
+        "node.go",
+        "sort.go",
+    ],
+    importmap = "github.com/cockroachdb/cockroach/vendor/github.com/emicklei/dot",
+    importpath = "github.com/emicklei/dot",
+    visibility = ["//visibility:public"],
+)
