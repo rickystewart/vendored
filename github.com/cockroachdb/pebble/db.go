@@ -1331,12 +1331,7 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 				continue
 			}
 		}
-		var l0ReadAmp int
-		if d.opts.Experimental.L0SublevelCompactions {
-			l0ReadAmp = d.mu.versions.currentVersion().L0Sublevels.ReadAmplification()
-		} else {
-			l0ReadAmp = d.mu.versions.currentVersion().Levels[0].Len()
-		}
+		l0ReadAmp := d.mu.versions.currentVersion().L0Sublevels.ReadAmplification()
 		if l0ReadAmp >= d.opts.L0StopWritesThreshold {
 			// There are too many level-0 files, so we wait.
 			if !stalled {
@@ -1383,8 +1378,10 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 				if recycleLogNum > 0 {
 					recycleLogName := base.MakeFilename(d.opts.FS, d.walDirname, fileTypeLog, recycleLogNum)
 					newLogFile, err = d.opts.FS.ReuseForWrite(recycleLogName, newLogName)
+					base.MustExist(d.opts.FS, newLogName, d.opts.Logger, err)
 				} else {
 					newLogFile, err = d.opts.FS.Create(newLogName)
+					base.MustExist(d.opts.FS, newLogName, d.opts.Logger, err)
 				}
 			}
 
